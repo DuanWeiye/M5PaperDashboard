@@ -1,0 +1,17 @@
+# Arduino / PlatformIO build artifacts
+build/
+.build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Arduino IDE
+*.cache
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*~
+.vscode/
+.idea/
