@@ -27,25 +27,20 @@
 #define DISCONNECT_TIMEOUT_MS 30000UL
 
 // ── 刷新策略(抗反白)────────────────────────────────────────────────────────
-// 反白的根因不是墨水自然衰减,而是局部刷新的串扰:只推送某一块时,另外两块的像素
-// 完全不被驱动,相邻块反复刷新会通过共享源极/VCOM 线对静止像素产生寄生扰动,日积
-// 月累把静止黑像素推向白。解法:每次有区块变化触发刷新时,三块一起重绘——变化的块
-// 用 REFRESH_MODE_FULL(反色全刷、零残影,但会闪);未变化的块用 REFRESH_MODE_KEEP
-// 补刷一次,把静止像素重新驱动回目标态以抵消反白。补刷内容与屏上完全相同,所以不会
-// 产生新残影。
+// 反白的根因:相邻块反复局部刷新,会通过共享源极/VCOM 线扰动静止块的像素,使其物理
+// 上慢慢淡掉(漂向白)。关键事实:IT8951 的差分模式(DU/A2/DU4)只驱动“新内容 ≠ 帧
+// 缓存中旧内容”的像素;而淡掉是物理漂移,控制器帧缓存里仍记着它是黑,于是再推一遍相同
+// 黑色内容时它判定“没变”而一个脉冲都不发 —— 淡像素永不被重驱。只有会刷整片的全刷家族
+// (GC16 / GL16)才会无视新旧、驱动区域内每个像素,才能把淡掉的像素拉回黑(也因此会闪)。
 //
-// 补刷模式按“越不闪”排序可选(库注释里的特性):
-//   UPDATE_MODE_DU  —— 纯黑白、Low 残影、~260ms,几乎不闪,对黑色重驱有力(默认,
-//                       最适合本画面的黑底白字);
-//   UPDATE_MODE_A2  —— 2 级、最快、最不闪,但残影最重(靠下面的深度全刷兜底清理);
-//   UPDATE_MODE_DU4 —— 4 级、~120ms,对比度偏低,Medium 残影;
-//   UPDATE_MODE_GL16—— 16 灰、保留抗锯齿,但带“白过渡”会比较明显地闪(之前那版)。
-#define REFRESH_MODE_FULL  UPDATE_MODE_GC16   // 变化块 / 深度全刷:反色全刷,零残影(会闪)
-#define REFRESH_MODE_KEEP  UPDATE_MODE_DU     // 静止块补刷:几乎不闪,重新驱动抵消反白
-
-// 深度全刷:每隔这么久,把三块全部用 REFRESH_MODE_FULL 反色刷一次,清理补刷模式长期
-// 累积的底灰/残影/直流偏置(清洁保险,与抗反白无关)。设为 0 可完全关闭。
-#define DEEP_CLEAN_MS  1800000UL   // 30 分钟
+// 策略:只要有任意一块变化,就把三块一起重刷——
+//   平时:全部用 REFRESH_MODE_KEEP(GL16),驱动所有像素消反白,闪烁比 GC16 轻;
+//   每累计 GC16_EVERY 次刷新:全部改用 REFRESH_MODE_FULL(GC16)反色全刷一遍,
+//                              清掉 GL16 累积的残影。
+// 全程静止(无任何变化)时一次都不刷——没有相邻刷新活动,也就不会反白。
+#define REFRESH_MODE_FULL  UPDATE_MODE_GC16   // 周期深刷:反色全刷、零残影(闪最明显)
+#define REFRESH_MODE_KEEP  UPDATE_MODE_GL16   // 平时刷新:驱动像素消反白,闪较轻、带些残影
+#define GC16_EVERY         30                 // 每累计这么多次刷新,做一次 GC16 全刷清残影
 
 // ── 屏幕 ─────────────────────────────────────────────────────────────────────
 
@@ -133,8 +128,8 @@ uint32_t lastRxMs      = 0;
 bool     fanOn         = false;
 bool     forceRefresh  = false;   // 风扇开/关时置位,不等更新间隔立即重绘
 
-uint32_t lastUpdateMs    = 0;
-uint32_t lastDeepCleanMs = 0;   // 上次“深度全刷”时间
+uint32_t lastUpdateMs = 0;
+uint8_t  refreshCount = 0;   // GL16 刷新累计数;到 GC16_EVERY 就触发一次 GC16 全刷
 bool     prevArrow[NUM_METRICS]  = {false, false, false};  // 上次绘制的箭头状态
 String   rxBuf        = "";
 
@@ -189,7 +184,6 @@ void setup() {
   prev = cur;
   for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
   lastUpdateMs = millis();
-  lastDeepCleanMs = millis();
 }
 
 void loop() {
@@ -207,30 +201,21 @@ void loop() {
     forceRefresh = false;
     lastUpdateMs = now;
 
-    // 是否到了“深度全刷”时间(三块全用 GC16 反色刷,清底灰/直流偏置)
-    bool deepClean = (DEEP_CLEAN_MS > 0) && (now - lastDeepCleanMs >= DEEP_CLEAN_MS);
-
-    // 先判断每块是否变化
-    bool changed[NUM_METRICS];
+    // 是否有任意一块变化(全程静止不会反白,也无需刷)
     bool any = false;
-    for (int i = 0; i < NUM_METRICS; i++) {
-      changed[i] = sectionChanged(i);
-      if (changed[i]) any = true;
-    }
+    for (int i = 0; i < NUM_METRICS; i++)
+      if (sectionChanged(i)) { any = true; break; }
 
-    // 只要有任意一块变化(或到了深度全刷),就重绘全部三块:变化的块用 GC16
-    // 反色全刷;未变化的块用补刷模式重新驱动一次以抵消反白。无任何变化时则什么
-    // 都不刷——没有相邻刷新活动,也就不会反白。
-    if (any || deepClean) {
-      for (int i = 0; i < NUM_METRICS; i++) {
-        m5epd_update_mode_t mode =
-            (changed[i] || deepClean) ? REFRESH_MODE_FULL : REFRESH_MODE_KEEP;
-        pushSection(i, mode);
-      }
+    if (any) {
+      // 平时用 GL16 刷三块消反白;每累计 GC16_EVERY 次改用 GC16 全刷清残影。
+      bool deepClean = (++refreshCount >= GC16_EVERY);
+      m5epd_update_mode_t mode = deepClean ? REFRESH_MODE_FULL : REFRESH_MODE_KEEP;
+      for (int i = 0; i < NUM_METRICS; i++) pushSection(i, mode);
+      if (deepClean) refreshCount = 0;
+
       prev = cur;
       prevConnected = connected;
       for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
-      if (deepClean) lastDeepCleanMs = now;
     }
   }
 }
