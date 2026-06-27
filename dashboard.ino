@@ -25,10 +25,27 @@
 #define LOOP_DELAY_MS       50
 #define UPDATE_INTERVAL_MS    10000UL
 #define DISCONNECT_TIMEOUT_MS 30000UL
-// 抗褪色:若某区块在此时间窗内未被重绘,即使数值不变也强制刷新一次。电子墨水
-// 颗粒会随时间松弛,图像逐渐发白;定期用全 GC16 重新驱动像素可保持清晰。只有
-// *陈旧* 的区块才会刷新,频繁变化的指标永远不会触发它。
-#define REFRESH_MAX_AGE_MS   900000UL   // 15 分钟
+
+// ── 刷新策略(抗反白)────────────────────────────────────────────────────────
+// 反白的根因不是墨水自然衰减,而是局部刷新的串扰:只推送某一块时,另外两块的像素
+// 完全不被驱动,相邻块反复刷新会通过共享源极/VCOM 线对静止像素产生寄生扰动,日积
+// 月累把静止黑像素推向白。解法:每次有区块变化触发刷新时,三块一起重绘——变化的块
+// 用 REFRESH_MODE_FULL(反色全刷、零残影,但会闪);未变化的块用 REFRESH_MODE_KEEP
+// 补刷一次,把静止像素重新驱动回目标态以抵消反白。补刷内容与屏上完全相同,所以不会
+// 产生新残影。
+//
+// 补刷模式按“越不闪”排序可选(库注释里的特性):
+//   UPDATE_MODE_DU  —— 纯黑白、Low 残影、~260ms,几乎不闪,对黑色重驱有力(默认,
+//                       最适合本画面的黑底白字);
+//   UPDATE_MODE_A2  —— 2 级、最快、最不闪,但残影最重(靠下面的深度全刷兜底清理);
+//   UPDATE_MODE_DU4 —— 4 级、~120ms,对比度偏低,Medium 残影;
+//   UPDATE_MODE_GL16—— 16 灰、保留抗锯齿,但带“白过渡”会比较明显地闪(之前那版)。
+#define REFRESH_MODE_FULL  UPDATE_MODE_GC16   // 变化块 / 深度全刷:反色全刷,零残影(会闪)
+#define REFRESH_MODE_KEEP  UPDATE_MODE_DU     // 静止块补刷:几乎不闪,重新驱动抵消反白
+
+// 深度全刷:每隔这么久,把三块全部用 REFRESH_MODE_FULL 反色刷一次,清理补刷模式长期
+// 累积的底灰/残影/直流偏置(清洁保险,与抗反白无关)。设为 0 可完全关闭。
+#define DEEP_CLEAN_MS  1800000UL   // 30 分钟
 
 // ── 屏幕 ─────────────────────────────────────────────────────────────────────
 
@@ -116,8 +133,8 @@ uint32_t lastRxMs      = 0;
 bool     fanOn         = false;
 bool     forceRefresh  = false;   // 风扇开/关时置位,不等更新间隔立即重绘
 
-uint32_t lastUpdateMs = 0;
-uint32_t lastPushMs[NUM_METRICS] = {0, 0, 0};   // 各区块上次重绘时间
+uint32_t lastUpdateMs    = 0;
+uint32_t lastDeepCleanMs = 0;   // 上次“深度全刷”时间
 bool     prevArrow[NUM_METRICS]  = {false, false, false};  // 上次绘制的箭头状态
 String   rxBuf        = "";
 
@@ -140,7 +157,7 @@ int  barPct(int idx);
 void valStr(int idx, char* buf, size_t len);
 bool arrowOn(int idx);
 bool sectionChanged(int idx);
-void pushSection(int idx);
+void pushSection(int idx, m5epd_update_mode_t mode);
 void pushAll();
 
 // ── 初始化与主循环 ───────────────────────────────────────────────────────────
@@ -172,6 +189,7 @@ void setup() {
   prev = cur;
   for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
   lastUpdateMs = millis();
+  lastDeepCleanMs = millis();
 }
 
 void loop() {
@@ -188,15 +206,31 @@ void loop() {
   if (forceRefresh || now - lastUpdateMs >= UPDATE_INTERVAL_MS) {
     forceRefresh = false;
     lastUpdateMs = now;
+
+    // 是否到了“深度全刷”时间(三块全用 GC16 反色刷,清底灰/直流偏置)
+    bool deepClean = (DEEP_CLEAN_MS > 0) && (now - lastDeepCleanMs >= DEEP_CLEAN_MS);
+
+    // 先判断每块是否变化
+    bool changed[NUM_METRICS];
     bool any = false;
     for (int i = 0; i < NUM_METRICS; i++) {
-      bool stale = (now - lastPushMs[i] >= REFRESH_MAX_AGE_MS);   // 是否陈旧待重绘
-      if (sectionChanged(i) || stale) { pushSection(i); any = true; }
+      changed[i] = sectionChanged(i);
+      if (changed[i]) any = true;
     }
-    if (any) {
+
+    // 只要有任意一块变化(或到了深度全刷),就重绘全部三块:变化的块用 GC16
+    // 反色全刷;未变化的块用补刷模式重新驱动一次以抵消反白。无任何变化时则什么
+    // 都不刷——没有相邻刷新活动,也就不会反白。
+    if (any || deepClean) {
+      for (int i = 0; i < NUM_METRICS; i++) {
+        m5epd_update_mode_t mode =
+            (changed[i] || deepClean) ? REFRESH_MODE_FULL : REFRESH_MODE_KEEP;
+        pushSection(i, mode);
+      }
       prev = cur;
       prevConnected = connected;
       for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
+      if (deepClean) lastDeepCleanMs = now;
     }
   }
 }
@@ -333,7 +367,7 @@ void drawUpArrow(int cx, int cy, int r) {
   sCanvas.fillRect(cx - sw, headB, 2 * sw + 1, (cy + r) - headB, C_BLACK);
 }
 
-void pushSection(int idx) {
+void pushSection(int idx, m5epd_update_mode_t mode) {
   int screenY = idx * SECTION_H;
 
   // ── 背景 ─────────────────────────────────────────────────────────────────────
@@ -366,11 +400,11 @@ void pushSection(int idx) {
   if (arrowOn(idx))
     drawUpArrow(ARROW_CX, ARROW_CY, ARROW_R);
 
-  // ── 把区块画布推送到正确的屏幕位置 ──────────────────────────────────────────
-  sCanvas.pushCanvas(0, screenY, UPDATE_MODE_GC16);
-  lastPushMs[idx] = millis();   // 重置该区块的抗褪色计时
+  // ── 把区块画布推送到正确的屏幕位置(刷新模式由调用方决定)────────────────────
+  sCanvas.pushCanvas(0, screenY, mode);
 }
 
 void pushAll() {
-  for (int i = 0; i < NUM_METRICS; i++) pushSection(i);
+  // 首次全屏绘制:全部用 REFRESH_MODE_FULL 反色全刷,得到最干净的底图
+  for (int i = 0; i < NUM_METRICS; i++) pushSection(i, REFRESH_MODE_FULL);
 }
