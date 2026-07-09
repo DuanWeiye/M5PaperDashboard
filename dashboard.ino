@@ -103,13 +103,17 @@
 
 // ── 风扇 / 继电器控制(G26) ─────────────────────────────────────────────────
 // 滞回:温度/功率达到或超过开启阈值时风扇 ON,低到或低于关闭阈值时 OFF;两阈值
-// 之间保持当前状态,以免继电器抖动。断连(无温度读数)时强制 OFF。
+// 之间保持当前状态。断连(无温度读数)时强制 OFF。
+// 关闭延时(抗抖动):负载回落到关阈值以下后,还要持续 FAN_OFF_DELAY_MS 才真正关;
+// 期间只要负载任一项再升到关阈值以上,计时立即清零重来。于是风扇一旦开启至少运转
+// 这段时间,负载在阈值附近反复波动也不会频繁开关。
 #define FAN_PIN         26
-#define FAN_ON_C        60     // °C —— 达到/超过此温度则开风扇
-#define FAN_OFF_C       50     // °C —— 仅当低于此温度才允许关
-#define FAN_ON_W        30     // W  —— 达到/超过此功率则开风扇
-#define FAN_OFF_W       20     // W  —— 仅当低于此功率才允许关
-#define FAN_ACTIVE_LOW  0      // 若继电器为低电平触发(LOW 导通),设为 1
+#define FAN_ON_C        60         // °C —— 达到/超过此温度则开风扇
+#define FAN_OFF_C       50         // °C —— 仅当低于此温度才允许关
+#define FAN_ON_W        30         // W  —— 达到/超过此功率则开风扇
+#define FAN_OFF_W       20         // W  —— 仅当低于此功率才允许关
+#define FAN_OFF_DELAY_MS 60000UL   // ms —— 负载持续低于关阈值多久才真正关(1 分钟)
+#define FAN_ACTIVE_LOW  0          // 若继电器为低电平触发(LOW 导通),设为 1
 
 // 0 = 白,15 = 黑(M5Paper IT8951 约定)
 #define C_WHITE  0
@@ -126,6 +130,7 @@ bool     connected     = false;   // 收到一个有效数据包后置 true
 bool     prevConnected = false;
 uint32_t lastRxMs      = 0;
 bool     fanOn         = false;
+uint32_t fanOffEligibleSinceMs = 0;  // 负载连续低于关阈值的起始时刻(0 = 未在低负载/已清零)
 bool     forceRefresh  = false;   // 风扇开/关时置位,不等更新间隔立即重绘
 
 uint32_t lastUpdateMs = 0;
@@ -280,13 +285,28 @@ void setFan(bool on) {
 }
 
 void updateFan() {
-  if (!connected) { if (fanOn) setFan(false); return; }   // 无数据 → 关风扇
+  if (!connected) {                     // 无数据 → 立即关(安全优先,不受延时约束)
+    if (fanOn) setFan(false);
+    fanOffEligibleSinceMs = 0;
+    return;
+  }
   if (!fanOn) {
     // 温度 或 功率 任一越过高阈值则开
-    if (cur.temp >= FAN_ON_C || cur.pwr >= FAN_ON_W) setFan(true);
+    if (cur.temp >= FAN_ON_C || cur.pwr >= FAN_ON_W) {
+      setFan(true);
+      fanOffEligibleSinceMs = 0;        // 刚开:关闭计时清零,重新起表
+    }
   } else {
-    // 仅当温度 且 功率都回落到各自低阈值以下才关
-    if (cur.temp <= FAN_OFF_C && cur.pwr <= FAN_OFF_W) setFan(false);
+    // 关闭延时:温度 且 功率都回落到低阈值以下才算"可关",并须持续 FAN_OFF_DELAY_MS。
+    // 中途负载任一项升回阈值以上就清零重计,于是每次开启后至少运转这段时间。
+    bool offEligible = (cur.temp <= FAN_OFF_C && cur.pwr <= FAN_OFF_W);
+    if (!offEligible) {
+      fanOffEligibleSinceMs = 0;        // 负载仍高:清零,持续时间重新计
+    } else {
+      uint32_t now = millis();
+      if (fanOffEligibleSinceMs == 0) fanOffEligibleSinceMs = now;   // 刚进入低负载,起表
+      if (now - fanOffEligibleSinceMs >= FAN_OFF_DELAY_MS) setFan(false);
+    }
   }
 }
 
