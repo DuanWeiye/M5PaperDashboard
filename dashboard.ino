@@ -27,20 +27,44 @@
 #define DISCONNECT_TIMEOUT_MS 30000UL
 
 // ── 刷新策略(抗反白)────────────────────────────────────────────────────────
-// 反白的根因:相邻块反复局部刷新,会通过共享源极/VCOM 线扰动静止块的像素,使其物理
-// 上慢慢淡掉(漂向白)。关键事实:IT8951 的差分模式(DU/A2/DU4)只驱动“新内容 ≠ 帧
-// 缓存中旧内容”的像素;而淡掉是物理漂移,控制器帧缓存里仍记着它是黑,于是再推一遍相同
-// 黑色内容时它判定“没变”而一个脉冲都不发 —— 淡像素永不被重驱。只有会刷整片的全刷家族
-// (GC16 / GL16)才会无视新旧、驱动区域内每个像素,才能把淡掉的像素拉回黑(也因此会闪)。
+// 反白(黑态褪成灰白)的根因经热像实测已确认是**面板下方芯片区的局部自发热**,不是早先
+// 以为的局部刷新串扰。2026-07-10 实测(室温 26.3 °C):反白最严重处 33.7 °C(+7.4 °C),
+// 屏幕其余部分 27 °C(+0.7 °C ≈ 室温)。判据:
+//   · 其余部分几乎等于室温 → 排除环境热、排除整机蓄热;
+//   · 只有一处集中热点     → 是某个持续耗电的元件,而非大面积发热(如电池充电);
+//   · 三块目前刷新方式完全相同,却只有下半部发白 → 串扰假说被证伪。
+// 机理:墨水层夹在外壳与主板之间,比外表面读数更热(约 35–40 °C),已进入这类面板图像
+// 保持能力陡降的区间。温度升高使胶囊内液体粘度下降、布朗运动增强、TFT 漏电增大(约每
+// 8–10 °C 翻倍),黑态保持不住而漂向白。
 //
-// 策略:只要有任意一块变化,就把三块一起重刷——
-//   平时:全部用 REFRESH_MODE_KEEP(GL16),驱动所有像素消反白,闪烁比 GC16 轻;
-//   每累计 GC16_EVERY 次刷新:全部改用 REFRESH_MODE_FULL(GC16)反色全刷一遍,
-//                              清掉 GL16 累积的残影。
-// 全程静止(无任何变化)时一次都不刷——没有相邻刷新活动,也就不会反白。
+// 边界为何如此干脆(下半部明显白、上半部完全没事):热区冷区衰减速率只差约 2 倍,但旧逻辑
+// 把刷新完全挂在“整数数值变化”上、没有任何时钟兜底 —— 主机空闲时一次都不刷,漂移可以连续
+// 累积几小时无上限,足以让热区越过肉眼可见阈值而冷区仍在阈值之下。
+//
+// 于是策略分两条正交的轴:
+//   A 降热(治本):刷完让 IT8951 进 StandBy,别再 24 小时常燃(见 EPD_STANDBY_IDLE);
+//                  每次只重刷真正变化的那一块,不再无谓地三块全刷(串扰假说已证伪)。
+//   B 封顶(兜底):按时钟强制刷新给累积封顶,且 GC16 深刷同时受“次数”和“时间”触发。
+// 注意:全刷家族(GC16 / GL16)无视新旧、驱动区域内每个像素,才能把淡掉的像素拉回黑;
+//       差分模式(DU/A2/DU4)只驱动“新内容 ≠ 帧缓存旧内容”的像素,对物理漂移无效。
 #define REFRESH_MODE_FULL  UPDATE_MODE_GC16   // 周期深刷:反色全刷、零残影(闪最明显)
 #define REFRESH_MODE_KEEP  UPDATE_MODE_GL16   // 平时刷新:驱动像素消反白,闪较轻、带些残影
 #define GC16_EVERY         30                 // 每累计这么多次刷新,做一次 GC16 全刷清残影
+
+// ── 降温 / 兜底 ──────────────────────────────────────────────────────────────
+// EPD_STANDBY_IDLE:M5EPD 的 begin() 之后 EPD 电源与 IT8951 一直停在 SYS_RUN,即使整晚
+// 不刷屏也在满功率空转发热 —— 热点就是这么来的。改成刷之前 Active()、刷完 StandBy(),
+// 把常燃变成按需。StandBy 比 Sleep 保守(保留 DRAM 自刷新,波形表不丢),先用它;若实测
+// 降温不够再考虑 Sleep() 或直接 disableEPDPower()。置 0 可一键退回原行为。
+// 空闲时 IT8951 进哪种低功耗态:2=Sleep(更深、更省) 1=StandBy(保守) 0=不休眠(原行为)。
+// 若出现刷新异常(花屏/不刷,即波形表丢失),把它改成 1 即可退回保守档。
+#define EPD_IDLE_MODE       2
+#define EPD_WAKE_DELAY_MS   50          // Active() 之后给 IT8951 的稳定时间(Sleep 唤醒比 StandBy 慢)
+
+// 时钟兜底:这两条只会**增加**刷新,不会降低刷新频率、不影响数据实时性。
+// 代价:三块 GL16 约 1.35 s,10 分钟一次 ≈ 0.2% 占空比,发热可忽略。
+#define REFRESH_MAX_AGE_MS  600000UL    // 超过 10 分钟没刷过,数值没变也强制刷一遍(给漂移封顶)
+#define GC16_MAX_AGE_MS    1800000UL    // 距上次 GC16 超过 30 分钟就深刷一次(空闲时也能清干净)
 
 // ── 屏幕 ─────────────────────────────────────────────────────────────────────
 
@@ -115,6 +139,13 @@
 #define FAN_OFF_DELAY_MS 60000UL   // ms —— 负载持续低于关阈值多久才真正关(1 分钟)
 #define FAN_ACTIVE_LOW  0          // 若继电器为低电平触发(LOW 导通),设为 1
 
+// 继电器(M5Stack 三线式模块)的 5V 取自 PORT.B,由板上 EXT 5V 升压电路提供。
+// M5.begin() 之后这条升压一直开着,但风扇不转时它没有任何负载,纯属空耗。
+// 置 1 则:开风扇前才给 EXT 上电,关风扇后立刻断掉。
+// 注意上下电顺序 —— 上电时先供 5V 再给信号,断电时先撤信号再断 5V,避免经信号脚倒灌。
+#define FAN_GATE_EXT_POWER  1
+#define FAN_EXT_SETTLE_MS   50     // 给 EXT 5V 的建立时间
+
 // 0 = 白,15 = 黑(M5Paper IT8951 约定)
 #define C_WHITE  0
 #define C_BLACK  15
@@ -133,7 +164,10 @@ bool     fanOn         = false;
 uint32_t fanOffEligibleSinceMs = 0;  // 负载连续低于关阈值的起始时刻(0 = 未在低负载/已清零)
 bool     forceRefresh  = false;   // 风扇开/关时置位,不等更新间隔立即重绘
 
-uint32_t lastUpdateMs = 0;
+uint32_t lastUpdateMs  = 0;
+uint32_t lastPushMs[NUM_METRICS] = {0, 0, 0};  // 各块上次被驱动的时刻(REFRESH_MAX_AGE_MS 按块兜底)
+uint32_t lastGc16Ms    = 0;  // 上次 GC16 深刷的时刻(用于 GC16_MAX_AGE_MS 兜底)
+uint32_t lastAfsrWaitMs = 0; // 上次待机前等面板刷完花了多久(诊断用,经 [T] 回报)
 uint8_t  refreshCount = 0;   // GL16 刷新累计数;到 GC16_EVERY 就触发一次 GC16 全刷
 bool     prevArrow[NUM_METRICS]  = {false, false, false};  // 上次绘制的箭头状态
 String   rxBuf        = "";
@@ -157,8 +191,11 @@ int  barPct(int idx);
 void valStr(int idx, char* buf, size_t len);
 bool arrowOn(int idx);
 bool sectionChanged(int idx);
+void saveSectionPrev(int idx);
 void pushSection(int idx, m5epd_update_mode_t mode);
 void pushAll();
+void epdWake();
+void epdRest();
 
 // ── 初始化与主循环 ───────────────────────────────────────────────────────────
 
@@ -186,9 +223,13 @@ void setup() {
   sCanvas.createRender(FONT_VALUE, 24);
 
   pushAll();
+  epdRest();                 // 底图画完就让 IT8951 待机,后续按需唤醒
   prev = cur;
   for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
-  lastUpdateMs = millis();
+  uint32_t t0   = millis();
+  lastUpdateMs  = t0;
+  for (int i = 0; i < NUM_METRICS; i++) lastPushMs[i] = t0;   // 兜底计时从开机起算
+  lastGc16Ms    = t0;        // pushAll 本身就是一次 GC16 深刷
 }
 
 void loop() {
@@ -206,21 +247,36 @@ void loop() {
     forceRefresh = false;
     lastUpdateMs = now;
 
-    // 是否有任意一块变化(全程静止不会反白,也无需刷)
+    // 逐块判断是否需要重绘:①数值变了,或②这一块自己太久没被驱动过。
+    // 兜底必须**按块**算:反白发生在长期不重绘的那一块上,而不是"整屏多久没刷过"——
+    // 内存频繁跳动时整屏一直在刷,但温度/功率那两块可能很久没被驱动,正是它们会褪色。
+    bool needPush[NUM_METRICS];
     bool any = false;
-    for (int i = 0; i < NUM_METRICS; i++)
-      if (sectionChanged(i)) { any = true; break; }
+    for (int i = 0; i < NUM_METRICS; i++) {
+      needPush[i] = sectionChanged(i) ||
+                    (now - lastPushMs[i] >= REFRESH_MAX_AGE_MS);
+      if (needPush[i]) any = true;
+    }
 
     if (any) {
-      // 平时用 GL16 刷三块消反白;每累计 GC16_EVERY 次改用 GC16 全刷清残影。
-      bool deepClean = (++refreshCount >= GC16_EVERY);
+      // 深刷时机:累计次数到了,或距上次 GC16 太久(空闲时段靠后者兜底)
+      bool deepClean = (++refreshCount >= GC16_EVERY) ||
+                       (now - lastGc16Ms >= GC16_MAX_AGE_MS);
+      // 深刷时三块一起清残影;平时只刷需要刷的块 —— 面板驱动工作量约降到 1/3
       m5epd_update_mode_t mode = deepClean ? REFRESH_MODE_FULL : REFRESH_MODE_KEEP;
-      for (int i = 0; i < NUM_METRICS; i++) pushSection(i, mode);
-      if (deepClean) refreshCount = 0;
 
-      prev = cur;
+      epdWake();
+      for (int i = 0; i < NUM_METRICS; i++) {
+        if (!deepClean && !needPush[i]) continue;
+        pushSection(i, mode);
+        lastPushMs[i] = millis();
+        saveSectionPrev(i);   // 只把已重绘块的基准前移,没刷的块保持旧基准
+      }
+      epdRest();
+
+      if (deepClean) { refreshCount = 0; lastGc16Ms = millis(); }
+      // 连接状态一变会让三块同时判定为“已变化”,故此处无条件前移是安全的
       prevConnected = connected;
-      for (int i = 0; i < NUM_METRICS; i++) prevArrow[i] = arrowOn(i);
     }
   }
 }
@@ -249,8 +305,11 @@ void reportTempHum() {
   if (isnan(t) || isnan(h)) {
     Serial.println("{\"error\": \"sht30 read failed\"}");
   } else {
-    char buf[48];
-    snprintf(buf, sizeof(buf), "{\"Temp\": %.1f, \"Hum\": %.1f}", t, h);
+    // 附带 afsr_ms:上次待机前等面板刷完的毫秒数。设备没有调试口,靠它从主机侧确认
+    // 刷新确实跑完了才 StandBy(0 表示还没刷过或没等到)。JSON 多一个键不影响解析。
+    char buf[80];
+    snprintf(buf, sizeof(buf), "{\"Temp\": %.1f, \"Hum\": %.1f, \"afsr_ms\": %lu}",
+             t, h, (unsigned long)lastAfsrWaitMs);
     Serial.println(buf);
   }
 }
@@ -280,7 +339,20 @@ void setFan(bool on) {
   fanOn = on;
   int level = on ? HIGH : LOW;
   if (FAN_ACTIVE_LOW) level = !level;
+
+#if FAN_GATE_EXT_POWER
+  if (on) {
+    M5.enableEXTPower();            // 先供 5V
+    delay(FAN_EXT_SETTLE_MS);       // 等它建立
+    digitalWrite(FAN_PIN, level);   // 再给信号
+  } else {
+    digitalWrite(FAN_PIN, level);   // 先撤信号
+    M5.disableEXTPower();           // 再断 5V,消除风扇不转时升压电路的空耗
+  }
+#else
   digitalWrite(FAN_PIN, level);
+#endif
+
   if (changed) forceRefresh = true;   // 立即把箭头变化反映到屏幕上
 }
 
@@ -353,6 +425,17 @@ bool sectionChanged(int idx) {
   return false;
 }
 
+// 把某一块的对比基准前移到当前值。必须逐块做:现在只重刷变化的块,若整体 prev = cur,
+// 未重绘块的新数值会被当成“已画过”而永远刷不出来。
+void saveSectionPrev(int idx) {
+  prevArrow[idx] = arrowOn(idx);
+  switch (idx) {
+    case 0: prev.mem  = cur.mem; prev.memGB = cur.memGB; break;
+    case 1: prev.temp = cur.temp; break;
+    case 2: prev.pwr  = cur.pwr;  break;
+  }
+}
+
 // ── 绘制 ─────────────────────────────────────────────────────────────────────
 
 // 伪粗体:在微小偏移处叠印字符串来加粗笔画(载入的 TTF 只有一种字重)。
@@ -412,4 +495,33 @@ void pushSection(int idx, m5epd_update_mode_t mode) {
 void pushAll() {
   // 首次全屏绘制:全部用 REFRESH_MODE_FULL 反色全刷,得到最干净的底图
   for (int i = 0; i < NUM_METRICS; i++) pushSection(i, REFRESH_MODE_FULL);
+}
+
+// ── IT8951 电源状态 ──────────────────────────────────────────────────────────
+// 库的 begin() 之后 IT8951 一直停在 SYS_RUN,不刷屏也在空转发热,而它正好位于反白区
+// 正下方。改为刷之前唤醒、刷完待机,把 24 小时常燃变成按需通电。
+
+void epdWake() {
+#if EPD_IDLE_MODE
+  M5.EPD.Active();
+  delay(EPD_WAKE_DELAY_MS);   // 给 IT8951 一点稳定时间再灌数据
+#endif
+}
+
+void epdRest() {
+#if EPD_IDLE_MODE
+  // 必须先等面板把最后一次刷新走完再待机。pushCanvas() 是**异步**的:
+  // UpdateArea() 只在开头 CheckAFSR() 等「上一次」刷完,发出 DPY_BUF_AREA 命令后
+  // 立刻返回,此时面板还要再驱动约 450 ms。中间几块靠下一次 pushSection 开头的
+  // CheckAFSR() 替它们等完,而最后一块没有"下一次"——不等就 StandBy() 会把它的
+  // 刷新拦腰切断,表现为该块永远刷不出来。
+  uint32_t t0 = millis();
+  M5.EPD.CheckAFSR();         // 轮询 LUTAFSR 直到面板空闲(3 秒超时)
+  lastAfsrWaitMs = millis() - t0;
+  #if EPD_IDLE_MODE == 2
+    M5.EPD.Sleep();           // 更深:多关一些时钟域
+  #else
+    M5.EPD.StandBy();         // 保守:保留 DRAM 自刷新,波形表和帧缓存不丢
+  #endif
+#endif
 }
